@@ -52,8 +52,13 @@ type Entry struct {
 	// snapshot or remove it.
 	ID EntryID
 
+	Name string
+
 	// Schedule on which this job should be run.
 	Schedule Schedule
+
+	// Enabled
+	Enabled bool
 
 	// Next time the job will run, or the zero time if Cron has not been
 	// started or this entry's schedule is unsatisfiable
@@ -97,17 +102,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -138,30 +143,32 @@ func (f FuncJob) Run() { f() }
 // AddFunc adds a func to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(name, spec string, cmd func()) (EntryID, error) {
+	return c.AddJob(name, spec, FuncJob(cmd))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+func (c *Cron) AddJob(name, spec string, cmd Job) (EntryID, error) {
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
 		return 0, err
 	}
-	return c.Schedule(schedule, cmd), nil
+	return c.Schedule(name, schedule, cmd), nil
 }
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+func (c *Cron) Schedule(name string, schedule Schedule, cmd Job) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
 	entry := &Entry{
 		ID:         c.nextID,
+		Name:       name,
 		Schedule:   schedule,
+		Enabled:    true,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
 	}
@@ -211,6 +218,31 @@ func (c *Cron) Remove(id EntryID) {
 	}
 }
 
+// DisableJob disables a job by its ID
+func (c *Cron) DisableJob(id EntryID) bool {
+	return c.setJobEnabled(id, false)
+}
+
+// EnableJob enables a job by its ID
+func (c *Cron) EnableJob(id EntryID) bool {
+	return c.setJobEnabled(id, true)
+}
+
+// SetJobEnabled enables or disables a job by its ID
+func (c *Cron) setJobEnabled(id EntryID, enabled bool) bool {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+
+	// Find and update the entry
+	for _, entry := range c.entries {
+		if entry.ID == id {
+			entry.Enabled = enabled
+			return true
+		}
+	}
+	return false
+}
+
 // Start the cron scheduler in its own goroutine, or no-op if already started.
 func (c *Cron) Start() {
 	c.runningMu.Lock()
@@ -243,7 +275,7 @@ func (c *Cron) run() {
 	now := c.now()
 	for _, entry := range c.entries {
 		entry.Next = entry.Schedule.Next(now)
-		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
+		c.logger.Info("schedule", "now", now, "entry", entry.ID, "name", entry.Name, "next", entry.Next)
 	}
 
 	for {
@@ -270,10 +302,14 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+
+					if e.Enabled {
+						c.startJob(e.WrappedJob)
+					}
+
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
-					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
+					c.logger.Info("run", "now", now, "entry", e.ID, "name", e.Name, "next", e.Next)
 				}
 
 			case newEntry := <-c.add:
@@ -281,7 +317,7 @@ func (c *Cron) run() {
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
 				c.entries = append(c.entries, newEntry)
-				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
+				c.logger.Info("added", "now", now, "entry", newEntry.ID, "name", newEntry.Name, "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()
